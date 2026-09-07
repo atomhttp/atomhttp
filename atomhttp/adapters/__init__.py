@@ -1,4 +1,5 @@
-from .http_adapter import HTTPAdapter
+from .base import BaseAdapter
 from .mock_adapter import MockAdapter
+from .urllib3_adapter import HTTPAdapter
 
-__all__ = ['HTTPAdapter', 'MockAdapter']
+__all__ = ["BaseAdapter", "HTTPAdapter", "MockAdapter"]

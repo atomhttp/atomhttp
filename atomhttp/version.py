@@ -1,5 +1,3 @@
-"""
-Version information for AtomHTTP.
-"""
+"""AtomHTTP version information."""
 
-__version__ = "1.2.4"
+__version__ = "2.0.0"

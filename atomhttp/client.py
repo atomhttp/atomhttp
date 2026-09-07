@@ -1,620 +1,299 @@
 """
-AtomHTTP Client Module
-----------------------
-Main HTTP client class for the AtomHTTP library, providing a comprehensive
-interface for making HTTP requests with support for interceptors, progress
-tracking, FormData, concurrent requests, and extensive configuration options.
+Client Module
+--------------
+:class:`AtomHTTP` is the primary, **synchronous** client -- no ``await``
+required anywhere, every method returns a :class:`~atomhttp.response.Response`
+directly. This is a deliberate change from v1, where the entire library was
+unusable without ``async``/``await`` even for the simplest ``GET``.
 
-This module contains the AtomHTTP client class which serves as the primary
-entry point for all HTTP operations. It provides a clean, axios-like API
-with support for all standard HTTP methods, request/response interceptors,
-upload/download progress tracking, automatic JSON serialization, and more.
+:class:`AsyncAtomHTTP` is the fully optional async counterpart. It shares
+100% of the request-building and transport logic with :class:`AtomHTTP` --
+it simply runs the same blocking call in a worker thread
+(``loop.run_in_executor``) so the event loop stays responsive. There is no
+``aiohttp`` anywhere in this library; both clients are backed by the same
+``urllib3``-based adapter (:class:`atomhttp.adapters.HTTPAdapter`), which
+means connection pooling, retries, and cookies behave identically whether
+or not you use ``async``.
 """
 
 import asyncio
-from typing import Dict, Any, Optional, Callable, List, Union
-from urllib.parse import urljoin, urlencode, parse_qs
-from .core.request import RequestHandler
-from .core.response import Response
-from .core.config import RequestConfig
-from .core.defaults import Defaults
-from .core.form_data import FormData
-from .interceptors.manager import InterceptorManager
-from .errors.http_errors import AtomHTTPError, AtomHTTPRequestError
+import concurrent.futures
+import inspect
+from typing import Any, Callable, Dict, List, Optional, Union
+from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
+
+from .adapters import HTTPAdapter
+from .adapters.base import BaseAdapter
+from .config import RequestConfig
+from .cookies import CookieJar
+from .defaults import Defaults
+from .interceptors import InterceptorManager
+from .response import Response
+
+__all__ = ["AtomHTTP", "AsyncAtomHTTP", "Interceptors"]
 
 
-class AtomHTTP:
-    """
-    Main HTTP client class providing a comprehensive interface for HTTP requests.
-    
-    This client is the primary entry point for the AtomHTTP library. It supports:
-        - All HTTP methods (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS)
-        - Request and response interceptors
-        - Upload and download progress tracking
-        - FormData (multipart/form-data) support
-        - Automatic JSON serialization/deserialization
-        - Base URL configuration
-        - Custom headers and query parameters
-        - Timeout and redirect configuration
-        - Concurrent request helpers (all, spread)
-        - Type hints for better IDE support
-    
-    The client maintains default configuration that applies to all requests,
-    which can be overridden on a per-request basis. It also manages a session
-    with connection pooling for optimal performance.
-    
-    Attributes:
-        defaults (Defaults): Default configuration for all requests
-        interceptors (InterceptorManager): Manager for request/response interceptors
-        _request_handler (RequestHandler): Internal handler for request execution
-    
-    Example:
-        >>> client = AtomHTTP({'baseURL': 'https://api.example.com', 'timeout': 30})
-        >>> response = await client.get('/users', params={'page': 1})
-        >>> print(response.status, response.data)
-    """
-    
-    def __init__(self, config: Optional[Union[RequestConfig, Dict]] = None):
-        """
-        Initialize a new AtomHTTP client with optional configuration.
-        
-        Args:
-            config (Optional[Union[RequestConfig, Dict]]): Initial configuration
-                for the client. Can be a RequestConfig object or a dictionary
-                with configuration keys. If None, defaults are used.
-        
-        Example:
-            >>> # Using dictionary
-            >>> client = AtomHTTP({'baseURL': 'https://api.example.com', 'timeout': 10})
-            >>> 
-            >>> # Using RequestConfig object
-            >>> config = RequestConfig(baseURL='https://api.example.com', timeout=10)
-            >>> client = AtomHTTP(config)
-        """
-        # Initialize default configuration
+class _InterceptorChannel:
+    """Axios-style ``client.interceptors.request.use(fn)`` handle."""
+
+    def __init__(self, manager: InterceptorManager, is_response: bool):
+        self._manager = manager
+        self._is_response = is_response
+
+    def use(self, fn: Callable) -> int:
+        return self._manager.use(fn, is_response=self._is_response)
+
+    def eject(self, index: int) -> None:
+        self._manager.eject(index, is_response=self._is_response)
+
+
+class Interceptors:
+    """Holds the ``request``/``response`` interceptor channels for a client."""
+
+    def __init__(self) -> None:
+        self.manager = InterceptorManager()
+        self.request = _InterceptorChannel(self.manager, is_response=False)
+        self.response = _InterceptorChannel(self.manager, is_response=True)
+
+
+def _build_url(base_url: str, url: str, params: Optional[Dict[str, Any]]) -> str:
+    """Join ``base_url`` + ``url`` and merge in query ``params``."""
+    is_absolute = url.startswith(("http://", "https://"))
+    full = url if is_absolute else f"{base_url.rstrip('/')}/{url.lstrip('/')}" if base_url else url
+
+    if not params:
+        return full
+
+    parts = urlsplit(full)
+    existing = parse_qsl(parts.query, keep_blank_values=True)
+    for key, value in params.items():
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            existing.extend((key, str(v)) for v in value)
+        else:
+            existing.append((key, str(value)))
+    new_query = urlencode(existing)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+
+
+class _ClientCore:
+    """Shared config-building logic used by both :class:`AtomHTTP` and :class:`AsyncAtomHTTP`."""
+
+    def __init__(
+        self,
+        base_url: str = "",
+        headers: Optional[Dict[str, str]] = None,
+        timeout: Union[int, float] = 30,
+        adapter: Optional[BaseAdapter] = None,
+        cookies: bool = True,
+        **default_overrides: Any,
+    ):
         self.defaults = Defaults()
-        
-        # Apply user configuration if provided
-        if config:
-            if isinstance(config, dict):
-                config_obj = RequestConfig(**config)
-            else:
-                config_obj = config
-            self.defaults.update(config_obj)
-        
-        # Initialize interceptor manager and request handler
-        self.interceptors = InterceptorManager()
-        self._request_handler = RequestHandler(self.defaults, self.interceptors)
-        self._is_closed = False
-    
-    async def __aenter__(self):
-        """
-        Async context manager entry point.
-        
-        Allows using the client with 'async with' statement for automatic
-        resource cleanup and guaranteed session closure.
-        
-        Returns:
-            AtomHTTP: Self instance
-        
+        self.defaults.update(
+            RequestConfig(baseURL=base_url, headers=headers or {}, timeout=timeout, **default_overrides)
+        )
+        self.interceptors = Interceptors()
+        self._adapter: BaseAdapter = adapter or HTTPAdapter()
+        self._cookie_jar: Optional[CookieJar] = CookieJar() if cookies else None
+
+    @property
+    def cookies(self) -> Optional[CookieJar]:
+        """The client's persistent cookie jar (``None`` if cookies were disabled)."""
+        return self._cookie_jar
+
+    def _build_config(self, method: str, url: str, **overrides: Any) -> RequestConfig:
+        base = self.defaults.to_dict()
+        base["method"] = method.upper()
+
+        params = overrides.pop("params", None)
+        base_headers = dict(base.get("headers", {}))
+        if "headers" in overrides and overrides["headers"]:
+            base_headers.update(overrides.pop("headers"))
+        base["headers"] = base_headers
+
+        base.update(overrides)
+        base["url"] = _build_url(base.get("baseURL", ""), url, params)
+        base.pop("baseURL", None)
+
+        config = RequestConfig(**{k: v for k, v in base.items() if k in RequestConfig.__dataclass_fields__})
+
+        if config.transformRequest and config.data is not None:
+            config.data = config.transformRequest(config.data)
+
+        return config
+
+    def _pick_adapter(self, config: RequestConfig) -> BaseAdapter:
+        return config.adapter or self._adapter
+
+    def close(self) -> None:
+        self._adapter.close()
+
+
+class AtomHTTP(_ClientCore):
+    """Synchronous HTTP client. Every method returns a :class:`Response` directly.
+
+    Example:
+        >>> client = AtomHTTP(base_url="https://api.example.com")
+        >>> response = client.get("/users/1")
+        >>> response.data
+        {'id': 1, 'name': 'Ada'}
+
+    Use as a context manager to release pooled connections automatically::
+
+        with AtomHTTP(base_url="https://api.example.com") as client:
+            client.get("/health")
+    """
+
+    def request(self, method: str = "GET", url: str = "", **kwargs: Any) -> Response:
+        """Perform a request. Runs request interceptors, sends it, runs response interceptors."""
+        config = self._build_config(method, url, **kwargs)
+
+        for interceptor in self.interceptors.manager.request_interceptors:
+            config = self._run_maybe_async(interceptor, config) or config
+
+        adapter = self._pick_adapter(config)
+        response = adapter.send(config, self._cookie_jar)
+
+        for interceptor in self.interceptors.manager.response_interceptors:
+            response = self._run_maybe_async(interceptor, response) or response
+
+        return response
+
+    @staticmethod
+    def _run_maybe_async(fn: Callable, value: Any) -> Any:
+        if inspect.iscoroutinefunction(fn):
+            return asyncio.run(fn(value))
+        return fn(value)
+
+    def get(self, url: str, **kwargs: Any) -> Response:
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url: str, data: Any = None, **kwargs: Any) -> Response:
+        return self.request("POST", url, data=data, **kwargs)
+
+    def put(self, url: str, data: Any = None, **kwargs: Any) -> Response:
+        return self.request("PUT", url, data=data, **kwargs)
+
+    def patch(self, url: str, data: Any = None, **kwargs: Any) -> Response:
+        return self.request("PATCH", url, data=data, **kwargs)
+
+    def delete(self, url: str, **kwargs: Any) -> Response:
+        return self.request("DELETE", url, **kwargs)
+
+    def head(self, url: str, **kwargs: Any) -> Response:
+        return self.request("HEAD", url, **kwargs)
+
+    def options(self, url: str, **kwargs: Any) -> Response:
+        return self.request("OPTIONS", url, **kwargs)
+
+    def all(
+        self, calls: List[Callable[[], Response]], max_workers: int = 10
+    ) -> List[Response]:
+        """Run several request thunks concurrently on a thread pool.
+
+        Because the underlying urllib3 pools are thread-safe, this gives you
+        real concurrency (and therefore real speedups for I/O-bound batches
+        of requests) without needing ``async``/``await`` anywhere.
+
         Example:
-            >>> async with AtomHTTP({'baseURL': 'https://api.example.com'}) as client:
-            ...     response = await client.get('/api/users')
-            ...     # Session automatically closed on exit
+            >>> client.all([
+            ...     lambda: client.get("/a"),
+            ...     lambda: client.get("/b"),
+            ... ])
+            [<Response [200 OK]>, <Response [200 OK]>]
         """
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(call) for call in calls]
+            return [f.result() for f in futures]
+
+    def as_async(self) -> "AsyncAtomHTTP":
+        """Return an :class:`AsyncAtomHTTP` sharing this client's config/adapter/cookies."""
+        async_client = AsyncAtomHTTP.__new__(AsyncAtomHTTP)
+        async_client.defaults = self.defaults
+        async_client.interceptors = self.interceptors
+        async_client._adapter = self._adapter
+        async_client._cookie_jar = self._cookie_jar
+        return async_client
+
+    def __enter__(self) -> "AtomHTTP":
         return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """
-        Async context manager exit point.
-        
-        Ensures the client is properly closed and all connections are cleaned up
-        when exiting the context.
-        
-        Args:
-            exc_type: Exception type if an error occurred
-            exc_val: Exception value if an error occurred
-            exc_tb: Exception traceback if an error occurred
-        """
-        await self.close()
-        return False
-    
-    async def request(self, config: Union[RequestConfig, Dict]) -> Response:
-        """
-        Make an HTTP request with the provided configuration.
-        
-        This is the core method for making requests. All other HTTP methods
-        (get, post, etc.) eventually call this method. It supports full
-        configuration including custom adapters, interceptors, and transformers.
-        
-        Args:
-            config (Union[RequestConfig, Dict]): Request configuration. Can be
-                a RequestConfig object or a dictionary with configuration keys.
-        
-        Returns:
-            Response: The HTTP response object containing data, status, headers
-        
-        Example:
-            >>> response = await client.request({
-            ...     'method': 'POST',
-            ...     'url': '/users',
-            ...     'data': {'name': 'John'},
-            ...     'headers': {'X-Custom': 'value'}
-            ... })
-        """
-        # Convert dictionary to RequestConfig if needed
-        if isinstance(config, dict):
-            config = RequestConfig(**config)
-        
-        # Merge with defaults and build full URL
-        merged_config = self._merge_config(config)
-        final_url = self._build_full_url(merged_config)
-        merged_config.url = final_url
-        
-        # Execute the request through the handler
-        return await self._request_handler.execute(merged_config)
-    
-    async def get(
-        self,
-        url: str,
-        params: Optional[Dict] = None,
-        response_type: str = 'json',
-        on_download_progress: Optional[Callable] = None,
-        **kwargs
-    ) -> Response:
-        """
-        Make an HTTP GET request.
-        
-        Args:
-            url (str): Request URL (absolute or relative to baseURL)
-            params (Optional[Dict]): Query parameters to append to URL
-            response_type (str): Expected response type ('json', 'text', 'blob',
-                                'arraybuffer', 'stream')
-            on_download_progress (Optional[Callable]): Callback for download progress
-            **kwargs: Additional request configuration options
-        
-        Returns:
-            Response: HTTP response object
-        """
-        config = RequestConfig(
-            url=url,
-            method='GET',
-            params=params or {},
-            responseType=response_type,
-            onDownloadProgress=on_download_progress,
-            **kwargs
-        )
-        return await self.request(config)
-    
-    async def post(
-        self,
-        url: str,
-        data: Any = None,
-        response_type: str = 'json',
-        on_upload_progress: Optional[Callable] = None,
-        on_download_progress: Optional[Callable] = None,
-        **kwargs
-    ) -> Response:
-        """
-        Make an HTTP POST request.
-        
-        Args:
-            url (str): Request URL
-            data (Any): Request body (dict for JSON, FormData, bytes, etc.)
-            response_type (str): Expected response type
-            on_upload_progress (Optional[Callable]): Callback for upload progress
-            on_download_progress (Optional[Callable]): Callback for download progress
-            **kwargs: Additional request configuration options
-        
-        Returns:
-            Response: HTTP response object
-        """
-        config = RequestConfig(
-            url=url,
-            method='POST',
-            data=data,
-            responseType=response_type,
-            onUploadProgress=on_upload_progress,
-            onDownloadProgress=on_download_progress,
-            **kwargs
-        )
-        return await self.request(config)
-    
-    async def put(
-        self,
-        url: str,
-        data: Any = None,
-        response_type: str = 'json',
-        on_upload_progress: Optional[Callable] = None,
-        on_download_progress: Optional[Callable] = None,
-        **kwargs
-    ) -> Response:
-        """
-        Make an HTTP PUT request.
-        
-        Args:
-            url (str): Request URL
-            data (Any): Request body
-            response_type (str): Expected response type
-            on_upload_progress (Optional[Callable]): Callback for upload progress
-            on_download_progress (Optional[Callable]): Callback for download progress
-            **kwargs: Additional request configuration options
-        
-        Returns:
-            Response: HTTP response object
-        """
-        config = RequestConfig(
-            url=url,
-            method='PUT',
-            data=data,
-            responseType=response_type,
-            onUploadProgress=on_upload_progress,
-            onDownloadProgress=on_download_progress,
-            **kwargs
-        )
-        return await self.request(config)
-    
-    async def patch(
-        self,
-        url: str,
-        data: Any = None,
-        response_type: str = 'json',
-        on_upload_progress: Optional[Callable] = None,
-        on_download_progress: Optional[Callable] = None,
-        **kwargs
-    ) -> Response:
-        """
-        Make an HTTP PATCH request.
-        
-        Args:
-            url (str): Request URL
-            data (Any): Request body
-            response_type (str): Expected response type
-            on_upload_progress (Optional[Callable]): Callback for upload progress
-            on_download_progress (Optional[Callable]): Callback for download progress
-            **kwargs: Additional request configuration options
-        
-        Returns:
-            Response: HTTP response object
-        """
-        config = RequestConfig(
-            url=url,
-            method='PATCH',
-            data=data,
-            responseType=response_type,
-            onUploadProgress=on_upload_progress,
-            onDownloadProgress=on_download_progress,
-            **kwargs
-        )
-        return await self.request(config)
-    
-    async def delete(
-        self,
-        url: str,
-        response_type: str = 'json',
-        on_download_progress: Optional[Callable] = None,
-        **kwargs
-    ) -> Response:
-        """
-        Make an HTTP DELETE request.
-        
-        Args:
-            url (str): Request URL
-            response_type (str): Expected response type
-            on_download_progress (Optional[Callable]): Callback for download progress
-            **kwargs: Additional request configuration options
-        
-        Returns:
-            Response: HTTP response object
-        """
-        config = RequestConfig(
-            url=url,
-            method='DELETE',
-            responseType=response_type,
-            onDownloadProgress=on_download_progress,
-            **kwargs
-        )
-        return await self.request(config)
-    
-    async def head(
-        self,
-        url: str,
-        response_type: str = 'json',
-        on_download_progress: Optional[Callable] = None,
-        **kwargs
-    ) -> Response:
-        """
-        Make an HTTP HEAD request.
-        
-        Args:
-            url (str): Request URL
-            response_type (str): Expected response type
-            on_download_progress (Optional[Callable]): Callback for download progress
-            **kwargs: Additional request configuration options
-        
-        Returns:
-            Response: HTTP response object
-        """
-        config = RequestConfig(
-            url=url,
-            method='HEAD',
-            responseType=response_type,
-            onDownloadProgress=on_download_progress,
-            **kwargs
-        )
-        return await self.request(config)
-    
-    async def options(
-        self,
-        url: str,
-        response_type: str = 'json',
-        on_download_progress: Optional[Callable] = None,
-        **kwargs
-    ) -> Response:
-        """
-        Make an HTTP OPTIONS request.
-        
-        Args:
-            url (str): Request URL
-            response_type (str): Expected response type
-            on_download_progress (Optional[Callable]): Callback for download progress
-            **kwargs: Additional request configuration options
-        
-        Returns:
-            Response: HTTP response object
-        """
-        config = RequestConfig(
-            url=url,
-            method='OPTIONS',
-            responseType=response_type,
-            onDownloadProgress=on_download_progress,
-            **kwargs
-        )
-        return await self.request(config)
-    
-    def _merge_config(self, config: RequestConfig) -> RequestConfig:
-        """
-        Merge user configuration with defaults.
-        
-        This method combines the provided request configuration with the
-        client's default configuration. Headers and params are merged
-        (custom values override defaults), while other fields are replaced
-        if present.
-        
-        Args:
-            config (RequestConfig): User-provided request configuration
-        
-        Returns:
-            RequestConfig: Merged configuration
-        """
-        # Start with a copy of defaults
-        merged = RequestConfig(**self.defaults.to_dict())
-        
-        # Merge all attributes from user config
-        config_dict = config.to_dict()
-        for key, value in config_dict.items():
-            if value is not None:
-                if key == 'headers' and isinstance(value, dict):
-                    if merged.headers is None:
-                        merged.headers = {}
-                    merged.headers.update(value)
-                elif key == 'params' and isinstance(value, dict):
-                    if merged.params is None:
-                        merged.params = {}
-                    merged.params.update(value)
-                else:
-                    setattr(merged, key, value)
-        
-        # Ensure baseURL is properly inherited from defaults
-        if not merged.baseURL and hasattr(self.defaults, 'baseURL') and self.defaults.baseURL:
-            merged.baseURL = self.defaults.baseURL
-        
-        return merged
-    
-    def _build_full_url(self, config: RequestConfig) -> str:
-        """
-        Build a complete URL from baseURL, path, and query parameters.
-        
-        This method handles:
-            - Absolute URLs (ignores baseURL)
-            - Relative URLs (combines with baseURL)
-            - Query parameter merging (preserves existing query string)
-        
-        Args:
-            config (RequestConfig): Configuration containing URL and parameters
-        
-        Returns:
-            str: Complete URL with base and query parameters
-        
-        Raises:
-            AtomHTTPRequestError: If relative URL is used without baseURL
-        """
-        url = config.url
-        base_url = config.baseURL
-        
-        # Combine baseURL and relative path
-        if base_url and url:
-            if url.startswith(('http://', 'https://')):
-                final_url = url
-            else:
-                base = base_url.rstrip('/')
-                path = url.lstrip('/')
-                final_url = f"{base}/{path}"
-        elif base_url and not url:
-            final_url = base_url
-        elif url:
-            if url.startswith(('http://', 'https://')):
-                final_url = url
-            else:
-                raise AtomHTTPRequestError(
-                    f"Cannot make request to relative URL '{url}' without baseURL",
-                    request=config,
-                    config=config
-                )
-        else:
-            raise AtomHTTPRequestError("URL is required", request=config, config=config)
-        
-        # Append or merge query parameters
-        if config.params and len(config.params) > 0:
-            if '?' in final_url:
-                base_part, existing_params = final_url.split('?', 1)
-                existing_dict = parse_qs(existing_params, keep_blank_values=True)
-                for key, value in config.params.items():
-                    existing_dict[key] = [str(value)]
-                flat_params = {}
-                for key, values in existing_dict.items():
-                    flat_params[key] = values[0] if len(values) == 1 else values
-                query_string = urlencode(flat_params, doseq=True)
-                final_url = f"{base_part}?{query_string}"
-            else:
-                query_string = urlencode(config.params)
-                final_url = f"{final_url}?{query_string}"
-        
-        return final_url
-    
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.close()
+
+
+class AsyncAtomHTTP(_ClientCore):
+    """Fully optional async client with the exact same request surface as :class:`AtomHTTP`.
+
+    No ``aiohttp`` involved -- every call is the same ``urllib3``-based
+    synchronous adapter, dispatched to a worker thread so it doesn't block
+    the event loop.
+
+    Example:
+        >>> async def main():
+        ...     async with AsyncAtomHTTP(base_url="https://api.example.com") as client:
+        ...         response = await client.get("/users/1")
+        ...         print(response.data)
+    """
+
+    async def request(self, method: str = "GET", url: str = "", **kwargs: Any) -> Response:
+        config = self._build_config(method, url, **kwargs)
+
+        for interceptor in self.interceptors.manager.request_interceptors:
+            config = await self._run_maybe_async(interceptor, config) or config
+
+        adapter = self._pick_adapter(config)
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, adapter.send, config, self._cookie_jar)
+
+        for interceptor in self.interceptors.manager.response_interceptors:
+            response = await self._run_maybe_async(interceptor, response) or response
+
+        return response
+
     @staticmethod
-    def all(requests: List[asyncio.Task]) -> asyncio.Future:
-        """
-        Execute multiple requests concurrently.
-        
-        This method waits for all provided coroutines/tasks to complete
-        and returns their results as a list. Similar to Promise.all() in
-        JavaScript.
-        
-        Args:
-            requests (List[asyncio.Task]): List of coroutines or tasks to execute
-        
-        Returns:
-            asyncio.Future: Future that resolves to list of all responses
-        
-        Example:
-            >>> tasks = [
-            ...     client.get('/users/1'),
-            ...     client.get('/users/2'),
-            ...     client.get('/users/3')
-            ... ]
-            >>> responses = await AtomHTTP.all(tasks)
-        """
-        return asyncio.gather(*requests)
-    
-    @staticmethod
-    async def spread(callback: Callable, *responses):
-        """
-        Spread array of responses to callback function arguments.
-        
-        This method takes a list of responses and passes them as individual
-        arguments to the callback function. Similar to axios.spread().
-        
-        Args:
-            callback (Callable): Function that receives individual response arguments
-            *responses: Variable number of response objects
-        
-        Returns:
-            Any: Result of the callback function
-        
-        Example:
-            >>> def process(res1, res2, res3):
-            ...     return [res1.status, res2.status, res3.status]
-            >>> 
-            >>> responses = await AtomHTTP.all(tasks)
-            >>> statuses = await AtomHTTP.spread(process, *responses)
-        """
-        return callback(*responses)
-    
-    def get_uri(self, config: Union[RequestConfig, Dict]) -> str:
-        """
-        Generate the full URI for a request configuration without executing it.
-        
-        This method is useful for debugging or when you need to see the
-        final URL that would be used for a request.
-        
-        Args:
-            config (Union[RequestConfig, Dict]): Request configuration
-        
-        Returns:
-            str: Full URI with baseURL and query parameters applied
-        
-        Example:
-            >>> uri = client.get_uri({
-            ...     'url': '/users',
-            ...     'params': {'page': 1, 'limit': 10}
-            ... })
-            >>> print(uri)
-            'https://api.example.com/users?page=1&limit=10'
-        """
-        # Convert dictionary to RequestConfig if needed
-        if isinstance(config, dict):
-            config = RequestConfig(**config)
-        
-        # Merge with defaults and build URL
-        if hasattr(self, 'defaults'):
-            merged = self._merge_config(config)
-        else:
-            merged = config
-        
-        return self._build_full_url(merged)
-    
-    def is_atomhttp_error(self, error: Exception) -> bool:
-        """
-        Check if an exception is a AtomHTTP error.
-        
-        This method is useful for error handling to distinguish between
-        AtomHTTP-specific errors and other exceptions.
-        
-        Args:
-            error (Exception): Exception to check
-        
-        Returns:
-            bool: True if the error is a AtomHTTP error, False otherwise
-        
-        Example:
-            >>> try:
-            ...     await client.get('https://invalid.com')
-            ... except Exception as e:
-            ...     if client.is_atomhttp_error(e):
-            ...         print(f"AtomHTTP error: {e.code}")
-        """
-        return isinstance(error, AtomHTTPError)
-    
-    @staticmethod
-    def FormData() -> FormData:
-        """
-        Create a new FormData instance for multipart/form-data requests.
-        
-        Returns:
-            FormData: New FormData object for building form data with files
-        
-        Example:
-            >>> form = AtomHTTP.FormData()
-            >>> form.append('username', 'john')
-            >>> form.append('avatar', open('photo.jpg', 'rb'), filename='photo.jpg')
-            >>> response = await client.post('/upload', data=form)
-        """
-        return FormData()
-    
-    async def close(self) -> None:
-        """
-        Close the client and clean up resources.
-        
-        This method should be called when the client is no longer needed
-        to properly close connections and release system resources.
-        
-        Alternatively, use the client with 'async with' statement for automatic
-        cleanup:
-        
-        Example:
-            >>> # Manual close
-            >>> client = AtomHTTP()
-            >>> try:
-            ...     response = await client.get('/data')
-            ... finally:
-            ...     await client.close()
-            
-            >>> # Automatic close with context manager
-            >>> async with AtomHTTP() as client:
-            ...     response = await client.get('/data')
-        """
-        if not self._is_closed:
-            if hasattr(self._request_handler, 'default_adapter'):
-                await self._request_handler.default_adapter.close()
-            self._is_closed = True
+    async def _run_maybe_async(fn: Callable, value: Any) -> Any:
+        if inspect.iscoroutinefunction(fn):
+            return await fn(value)
+        return fn(value)
+
+    async def get(self, url: str, **kwargs: Any) -> Response:
+        return await self.request("GET", url, **kwargs)
+
+    async def post(self, url: str, data: Any = None, **kwargs: Any) -> Response:
+        return await self.request("POST", url, data=data, **kwargs)
+
+    async def put(self, url: str, data: Any = None, **kwargs: Any) -> Response:
+        return await self.request("PUT", url, data=data, **kwargs)
+
+    async def patch(self, url: str, data: Any = None, **kwargs: Any) -> Response:
+        return await self.request("PATCH", url, data=data, **kwargs)
+
+    async def delete(self, url: str, **kwargs: Any) -> Response:
+        return await self.request("DELETE", url, **kwargs)
+
+    async def head(self, url: str, **kwargs: Any) -> Response:
+        return await self.request("HEAD", url, **kwargs)
+
+    async def options(self, url: str, **kwargs: Any) -> Response:
+        return await self.request("OPTIONS", url, **kwargs)
+
+    async def all(self, coros: List[Any]) -> List[Response]:
+        """``asyncio.gather`` shortcut for running several requests concurrently."""
+        return await asyncio.gather(*coros)
+
+    def as_sync(self) -> "AtomHTTP":
+        """Return an :class:`AtomHTTP` sharing this client's config/adapter/cookies."""
+        sync_client = AtomHTTP.__new__(AtomHTTP)
+        sync_client.defaults = self.defaults
+        sync_client.interceptors = self.interceptors
+        sync_client._adapter = self._adapter
+        sync_client._cookie_jar = self._cookie_jar
+        return sync_client
+
+    async def __aenter__(self) -> "AsyncAtomHTTP":
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        self.close()

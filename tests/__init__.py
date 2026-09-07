@@ -1,1 +1,0 @@
-"""AtomHTTP test suite"""

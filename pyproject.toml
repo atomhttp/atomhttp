@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "atomhttp"
-version = "1.2.4"
-description = "Professional asynchronous HTTP client for Python — interceptors, progress tracking, FormData, Blob, concurrent requests, connection pooling, retry mechanism, and full type hints"
+version = "2.0.0"
+description = "Sync-first, fully optional-async HTTP client for Python — interceptors, progress tracking, FormData, cookies, concurrent requests, connection pooling, retries, and full type hints. Built on urllib3, no aiohttp."
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [
     {name = "Abolfazl Hosseini", email = "tryuzr@gmail.com"}
 ]
-keywords = ["http", "client", "async", "await", "aiohttp", "rest", "api", "interceptor", "progress", "formdata"]
+keywords = ["http", "client", "sync", "async", "await", "urllib3", "rest", "api", "interceptor", "progress", "formdata"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
@@ -27,10 +27,9 @@ classifiers = [
     "Intended Audience :: Developers",
     "Topic :: Internet :: WWW/HTTP",
     "Topic :: Software Development :: Libraries :: Python Modules",
-    "Framework :: AsyncIO",
 ]
 dependencies = [
-    "aiohttp>=3.8.0",
+    "urllib3>=2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -49,7 +48,7 @@ test = [
     "pytest-cov>=4.0.0",
 ]
 all = [
-    "aiohttp>=3.8.0",
+    "urllib3>=2.0.0",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
@@ -65,14 +64,7 @@ Changelog = "https://github.com/inject3r/atomhttp/releases"
 [tool.setuptools]
 packages = [
     "atomhttp",
-    "atomhttp.core",
-    "atomhttp.interceptors",
     "atomhttp.adapters",
-    "atomhttp.transforms",
-    "atomhttp.errors",
-    "atomhttp.progress",
-    "atomhttp.auth",
-    "atomhttp.utils"
 ]
 include-package-data = true
 
@@ -82,18 +74,12 @@ atomhttp = ["py.typed"]
 [tool.pytest.ini_options]
 minversion = "7.0"
 testpaths = ["tests"]
-asyncio_mode = "auto"
+asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
 addopts = [
     "-v",
     "--strict-markers",
     "--tb=short",
-    "--cov=atomhttp",
-    "--cov-report=term-missing",
-    "--cov-report=html:htmlcov",
-    "--cov-report=xml:coverage.xml",
-    "-W",
-    "ignore::DeprecationWarning",
 ]
 markers = [
     "asyncio: marks tests as async",
@@ -102,128 +88,8 @@ markers = [
     "slow: marks tests as slow running",
 ]
 
-[tool.black]
-line-length = 100
-target-version = ['py38', 'py39', 'py310', 'py311', 'py312', 'py313']
-include = '\.pyi?$'
-extend-exclude = '''
-/(
-    \.eggs
-  | \.git
-  | \.hg
-  | \.mypy_cache
-  | \.tox
-  | \.venv
-  | _build
-  | buck-out
-  | build
-  | dist
-  | htmlcov
-)/
-'''
-
-[tool.isort]
-profile = "black"
-line_length = 100
-multi_line_output = 3
-include_trailing_comma = true
-force_grid_wrap = 0
-use_parentheses = true
-ensure_newline_before_comments = true
-
-[tool.mypy]
-python_version = "3.8"
-warn_return_any = true
-warn_unused_configs = true
-warn_unused_ignores = true
-warn_redundant_casts = true
-warn_no_return = true
-warn_unreachable = true
-strict_optional = true
-check_untyped_defs = true
-disallow_any_generics = false
-disallow_subclassing_any = false
-ignore_missing_imports = true
-exclude = [
-    "tests/",
-    "examples/",
-    "scripts/",
-    "docs/",
-]
-
-[tool.ruff]
-line-length = 100
-target-version = "py38"
-select = [
-    "E",
-    "W",
-    "F",
-    "I",
-    "C",
-    "B",
-    "UP",
-]
-ignore = [
-    "E501",
-    "B008",
-    "C901",
-]
-exclude = [
-    "tests/",
-    "examples/",
-    "scripts/",
-    "docs/",
-    "build/",
-    "dist/",
-]
-
-[tool.coverage.run]
-source = ["atomhttp"]
-omit = [
-    "*/tests/*",
-    "*/examples/*",
-    "*/scripts/*",
-    "*/__main__.py",
-    "*/cli.py",
-    "*/__pycache__/*",
-]
-data_file = ".coverage"
-
-[tool.coverage.report]
-exclude_lines = [
-    "pragma: no cover",
-    "def __repr__",
-    "if self.debug:",
-    "if __name__ == .__main__.:",
-    "raise AssertionError",
-    "raise NotImplementedError",
-    "if 0:",
-    "if False:",
-    "if TYPE_CHECKING:",
-    "@overload",
-]
-omit = [
-    "*/tests/*",
-    "*/examples/*",
-    "*/scripts/*",
-]
-precision = 2
-show_missing = true
-skip_covered = false
-sort = "cover"
-
-[tool.coverage.html]
-directory = "htmlcov"
-title = "AtomHTTP Coverage Report"
-
-[tool.coverage.xml]
-output = "coverage.xml"
-
-[tool.coverage.json]
-output = "coverage.json"
-
 [tool.bumpversion]
-current_version = "1.2.4"
+current_version = "2.0.0"
 commit = true
 tag = true
 tag_name = "v{new_version}"
@@ -238,13 +104,3 @@ replace = '__version__ = "{new_version}"'
 [tool.bumpversion.files."pyproject.toml"]
 search = 'version = "{current_version}"'
 replace = 'version = "{new_version}"'
-
-[tool.commitizen]
-name = "cz_conventional_commits"
-version = "1.2.4"
-version_files = [
-    "atomhttp/version.py",
-    "pyproject.toml",
-]
-tag_format = "v$version"
-bump_message = "chore: bump version $current_version → $new_version"
