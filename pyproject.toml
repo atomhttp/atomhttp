@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "atomhttp"
 version = "2.0.0"
-description = "Sync-first, fully optional-async HTTP client for Python — interceptors, progress tracking, FormData, cookies, concurrent requests, connection pooling, retries, and full type hints. Built on urllib3, no aiohttp."
+description = "A modern, developer-friendly HTTP client for Python with sync/async APIs and powerful request handling."
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
